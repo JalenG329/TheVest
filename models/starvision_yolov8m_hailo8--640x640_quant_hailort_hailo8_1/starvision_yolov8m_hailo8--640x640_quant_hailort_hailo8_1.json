@@ -1,0 +1,33 @@
+{
+    "ConfigVersion": 6,
+    "Checksum": "32dbf3045ed0835e3accba2aa0b1527c0424f22bb5a5a1beb82d2dc2f660f771",
+    "DEVICE": [
+        {
+            "DeviceType": "HAILO8",
+            "RuntimeAgent": "HAILORT",
+            "SupportedDeviceTypes": "HAILORT/HAILO8"
+        }
+    ],
+    "PRE_PROCESS": [
+        {
+            "InputN": 1,
+            "InputH": 640,
+            "InputW": 640,
+            "InputC": 3,
+            "InputQuantEn": true
+        }
+    ],
+    "MODEL_PARAMETERS": [
+        {
+            "ModelPath": "starvision_yolov8m_hailo8--640x640_quant_hailort_hailo8_1.hef"
+        }
+    ],
+    "POST_PROCESS": [
+        {
+            "OutputPostprocessType": "DetectionYoloV8",
+            "OutputNumClasses": 23,
+            "LabelsPath": "labels_starvision_yolov8m_hailo8.json",
+            "OutputConfThreshold": 0.018
+        }
+    ]
+}

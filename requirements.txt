@@ -1,0 +1,100 @@
+# Core Computer Vision and AI
+degirum
+degirum_tools
+opencv-python
+opencv-contrib-python
+numpy
+pandas
+
+# Camera Interface
+picamera2
+
+# Hardware Interface - I2C and GPIO
+adafruit-circuitpython-tca9548a
+adafruit-circuitpython-drv2605
+adafruit-blinka
+board
+busio
+
+# Image Processing and Computer Vision
+pillow
+scikit-image
+imutils
+
+# Object Tracking
+filterpy
+scipy
+
+# Video Processing and Stabilization
+vidstab
+
+# Threading and Async
+threading-timer
+
+# Data Handling and Serialization
+msgpack-numpy
+h5py
+pickle5
+
+# Utilities and System
+psutil
+pyyaml
+click
+tqdm
+pathlib2
+
+# Mathematical and Scientific Computing
+matplotlib
+seaborn
+
+# Logging and Configuration
+colorlog
+python-dotenv
+
+# Testing and Development
+pytest
+pytest-cov
+pytest-mock
+
+# Code Quality
+black
+flake8
+mypy
+pre-commit
+
+# Documentation
+sphinx
+sphinx-rtd-theme
+
+# Networking (for remote monitoring)
+requests
+flask
+
+# Time and Date Utilities
+python-dateutil
+
+# System Monitoring
+GPUtil
+
+# Audio Processing (if haptic feedback includes audio cues)
+pyaudio
+soundfile
+
+# Serial Communication (for additional hardware)
+pyserial
+
+# Machine Learning Utilities
+scikit-learn
+
+# Configuration Management
+configparser
+toml
+
+# Memory Profiling
+memory-profiler
+
+# Raspberry Pi Specific
+RPi.GPIO
+
+# Performance Monitoring
+line-profiler

@@ -1,0 +1,24 @@
+# Development environment configuration
+DEBUG: true
+LOG_LEVEL: "DEBUG"
+ENABLE_PROFILING: true
+
+# Camera settings for development
+CAMERA:
+  format: "RGB888"
+  size: [640, 480]
+  fps: 30
+
+# Model settings for development (smaller models for faster testing)
+MODEL_PATHS:
+  zoo_url: "/home/rohan/degirum_wearable_device/models"
+  detection_models:
+    - "yolo11n_silu_coco--640x640_quant_hailort_hailo8_1"
+  depth_models:
+    - "depth_anything_v2--224x224_quant_hailort_hailo8_1"
+
+# Reduced processing for development
+PROCESSING:
+  print_interval: 0.5  # Slower printing for debugging
+  depth_history_size: 2
+  depth_change_threshold: 10

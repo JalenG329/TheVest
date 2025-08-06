@@ -1,0 +1,42 @@
+{
+    "ConfigVersion": 10,
+    "Checksum": "f10064af3e5922cc2932fe363bf1f166f7e4b665b66808013fc39de2d379ec37",
+    "DEVICE": [
+        {
+            "DeviceType": "HAILO8",
+            "RuntimeAgent": "HAILORT",
+            "SupportedDeviceTypes": "HAILORT/HAILO8"
+        }
+    ],
+    "PRE_PROCESS": [
+        {
+            "InputType": "Image",
+            "InputN": 1,
+            "InputH": 640,
+            "InputW": 640,
+            "InputC": 3,
+            "InputQuantEn": true
+        }
+    ],
+    "MODEL_PARAMETERS": [
+        {
+            "ModelPath": "damoyolo_tinynasL35_M--640x640_quant_hailort_hailo8_1.hef"
+        }
+    ],
+    "POST_PROCESS": [
+        {
+            "OutputPostprocessType": "Detection",
+            "Strides": [
+                8,
+                16,
+                32
+            ],
+            "RegMax": 16,
+            "OutputConfThreshold": 0.3,
+            "OutputNMSThreshold": 0.6,
+            "OutputNumClasses": 80,
+            "LabelsPath": "coco_labels.json",
+            "PythonFile": "HailoDetectorDamoYOLO.py"
+        }
+    ]
+}

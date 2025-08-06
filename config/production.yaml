@@ -1,0 +1,31 @@
+# Production environment configuration
+DEBUG: false
+LOG_LEVEL: "INFO"
+ENABLE_PROFILING: false
+
+# Optimized camera settings for production
+CAMERA:
+  format: "RGB888"
+  size: [640, 480]
+  fps: 30
+
+# Full model ensemble for production
+MODEL_PATHS:
+  zoo_url: "/home/rohan/degirum_wearable_device/models"
+  detection_models:
+    - "yolo11n_silu_coco--640x640_quant_hailort_hailo8_1"
+    - "indoor_env_best--640x640_quant_hailort_hailo8_1"
+  depth_models:
+    - "depth_anything_v2--224x224_quant_hailort_hailo8_1"
+
+# Optimized processing for production
+PROCESSING:
+  print_interval: 0.1
+  depth_history_size: 3
+  depth_change_threshold: 15
+
+# Performance optimizations
+PERFORMANCE:
+  enable_threading: true
+  max_worker_threads: 4
+  buffer_size: 10

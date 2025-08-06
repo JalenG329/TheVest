@@ -1,0 +1,33 @@
+{
+    "ConfigVersion": 6,
+    "Checksum": "110e63b0a7a06446ae0493a303ef6aca68a29a2a4d8cc37e3d7a0f877089cc70",
+    "DEVICE": [
+        {
+            "DeviceType": "HAILO8",
+            "RuntimeAgent": "HAILORT",
+            "SupportedDeviceTypes": "HAILORT/HAILO8"
+        }
+    ],
+    "PRE_PROCESS": [
+        {
+            "InputN": 1,
+            "InputH": 640,
+            "InputW": 640,
+            "InputC": 3,
+            "InputQuantEn": true
+        }
+    ],
+    "MODEL_PARAMETERS": [
+        {
+            "ModelPath": "indoor_env_best--640x640_quant_hailort_hailo8_2.hef"
+        }
+    ],
+    "POST_PROCESS": [
+        {
+            "OutputPostprocessType": "DetectionYoloV8",
+            "OutputNumClasses": 3,
+            "LabelsPath": "labels_indoor_env_best.json",
+            "OutputConfThreshold": 0.3
+        }
+    ]
+}

@@ -1,0 +1,66 @@
+# Haptic Feedback Vest Configuration
+
+# Model paths
+MODEL_PATHS:
+  zoo_url: "/home/rohan/degirum_wearable_device/models"
+  detection_models:
+    - "yolo11n_silu_coco--640x640_quant_hailort_hailo8_1"
+    - "indoor_env_best--640x640_quant_hailort_hailo8_1"
+  depth_models:
+    - "depth_anything_v2--224x224_quant_hailort_hailo8_1"
+    - "fastdepth--224x224_quant_hailort_hailo8_1"
+    - "scdepthv3--320x256_quant_hailort_hailo8_1"
+
+# Camera configuration
+CAMERA:
+  format: "RGB888"
+  size: [640, 480]
+  inference_host: "@local"
+
+# Processing parameters
+PROCESSING:
+  print_interval: 0.1
+  depth_scale: [0.175, 0.311]  # (224/1280, 224/720)
+  depth_history_size: 3
+  depth_change_threshold: 15
+
+# Depth calculation
+DEPTH_CALCULATION:
+  focal_length: 800  # pixels
+  real_object_width: 0.07  # meters (average cell phone width)
+
+# Haptic feedback
+HAPTIC:
+  depth_range:
+    min: 18.91  # meters
+    max: 79.79  # meters
+  vibration_range:
+    min: 0
+    max: 127
+  target_objects:
+    - "cell phone"
+    - "remote"
+
+# Navigation obstacles
+NAVIGATION_OBSTACLES:
+  - "person"
+  - "bicycle"
+  - "car"
+  - "motorcycle"
+  - "bus"
+  - "truck"
+  - "traffic light"
+  - "fire hydrant"
+  - "stop sign"
+  - "parking meter"
+  - "bench"
+  - "chair"
+  - "potted plant"
+  - "dining table"
+  - "couch"
+
+# Tracking parameters
+TRACKING:
+  track_thresh: 0.3
+  min_matches: 200
+  orb_features: 2000

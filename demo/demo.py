@@ -31,9 +31,9 @@ CAMERA_RESOLUTION = (CAMERA_WIDTH, CAMERA_HEIGHT)
 DEPTH_MODEL_SIZE = 224
 DEPTH_MODEL_RESOLUTION = (DEPTH_MODEL_SIZE, DEPTH_MODEL_SIZE)
 
-SCALE = (DEPTH_MODEL_SIZE/CAMERA_WIDTH, DEPTH_MODEL_SIZE/CAMERA_HEIGHT)  # (x_scale, y_scale)
-DEPTH_HISTORY_SIZE = 3
-DEPTH_CHANGE_THRESHOLD = 15
+SCALE = (DEPTH_MODEL_SIZE/CAMERA_WIDTH, DEPTH_MODEL_SIZE/CAMERA_HEIGHT)  # Scale factor to convert between camera and depth model resolutions
+DEPTH_HISTORY_SIZE = 5  # Number of previous depth frames to keep for temporal smoothing
+DEPTH_CHANGE_THRESHOLD = 15  # Minimum change in depth values to be considered significant
 
 # Denoising parameters
 GAUSSIAN_KERNEL_SIZE = 5
@@ -86,6 +86,14 @@ OBJECT_EFFECTS = {
     'stairs': 14,
     'exit': 15,
     'door': 16
+}
+
+# Define different confidence thresholds for different object types
+DETECTION_THRESHOLDS = {
+    'person': 0.5,    # Keep higher threshold for person detection
+    'stairs': 0.3,    # Lower threshold for stairs - important for safety
+    'exit': 0.3,      # Lower threshold for exit signs - critical for navigation
+    'door': 0.35      # Lower threshold for doors - important for navigation
 }
 
 def quantize_intensity(intensity, levels=INTENSITY_LEVELS):
@@ -247,11 +255,12 @@ def trigger_object_detection_vibration(object_type, track_id):
         print(f"Known {object_type} (Track ID: {track_id}) - no vibration")
 
 def detect_objects(detection_result):
-    """Check for multiple object types in detection results with track ID support."""
+    """Check for multiple object types in detection results with track ID support and different thresholds."""
     detected_objects = []
     
     for item in detection_result._inference_results:
         label = item['label']
+        confidence = item.get('score', 0.0)  # Get confidence score
         
         # Get track ID directly - DeGirum ObjectTracker uses 'track_id' key
         track_id = item.get('track_id', None)
@@ -265,18 +274,26 @@ def detect_objects(detection_result):
         
         if label:
             label_lower = label.lower()
-            if 'person' in label_lower:
+            
+            # Check person detection with higher threshold
+            if 'person' in label_lower and confidence >= DETECTION_THRESHOLDS['person']:
                 detected_objects.append(('person', track_id))
-                print(f"Person detected: {label} (Track ID: {track_id})")
-            elif 'stair' in label_lower:
+                print(f"Person detected: {label} (Track ID: {track_id}, Confidence: {confidence:.2f})")
+                
+            # Check stairs detection with lower threshold
+            elif 'stair' in label_lower and confidence >= DETECTION_THRESHOLDS['stairs']:
                 detected_objects.append(('stairs', track_id))
-                print(f"Stairs detected: {label} (Track ID: {track_id})")
-            elif 'exit' in label_lower:
+                print(f"Stairs detected: {label} (Track ID: {track_id}, Confidence: {confidence:.2f})")
+                
+            # Check exit detection with lower threshold
+            elif 'exit' in label_lower and confidence >= DETECTION_THRESHOLDS['exit']:
                 detected_objects.append(('exit', track_id))
-                print(f"Exit sign detected: {label} (Track ID: {track_id})")
-            elif 'door' in label_lower:
+                print(f"Exit sign detected: {label} (Track ID: {track_id}, Confidence: {confidence:.2f})")
+                
+            # Check door detection with lower threshold
+            elif 'door' in label_lower and confidence >= DETECTION_THRESHOLDS['door']:
                 detected_objects.append(('door', track_id))
-                print(f"Door detected: {label} (Track ID: {track_id})")
+                print(f"Door detected: {label} (Track ID: {track_id}, Confidence: {confidence:.2f})")
 
     return detected_objects
 

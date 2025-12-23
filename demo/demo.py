@@ -41,9 +41,9 @@ GAUSSIAN_SIGMA = 1.5
 TEMPORAL_SMOOTHING_ALPHA = 0.3  # Lower values = more smoothing
 
 # Smooth vibration parameters
-RAMP_FACTOR = 0.4  # How fast intensity changes (0.1=slow, 0.9=fast)
+RAMP_FACTOR = 0.6  # How fast intensity changes (0.1=slow, 0.9=fast)
 HYSTERESIS_THRESHOLD = 0.08  # meters - prevents small fluctuations
-INTENSITY_LEVELS = 8  # Number of distinguishable intensity levels
+INTENSITY_LEVELS = 9  # Number of distinguishable intensity levels
 MIN_INTENSITY_CHANGE = 5  # Minimum change to update motor
 
 drv1 = DRV2605(mux[1])  # Channel 1
@@ -91,9 +91,9 @@ OBJECT_EFFECTS = {
 # Define different confidence thresholds for different object types
 DETECTION_THRESHOLDS = {
     'person': 0.5,    # Keep higher threshold for person detection
-    'stairs': 0.3,    # Lower threshold for stairs - important for safety
-    'exit': 0.3,      # Lower threshold for exit signs - critical for navigation
-    'door': 0.35      # Lower threshold for doors - important for navigation
+    'stairs': 0.012,    # Lower threshold for stairs - important for safety
+    'exit': 0.012,      # Lower threshold for exit signs - critical for navigation
+    'door': 0.012      # Lower threshold for doors - important for navigation
 }
 
 def quantize_intensity(intensity, levels=INTENSITY_LEVELS):

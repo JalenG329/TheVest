@@ -1,0 +1,339 @@
+# person_speed_haptic_test_v3_3_depth_first.py
+# --------------------------------------------
+# Version 3.3: Depth-first haptics with YOLO override by closest object
+# - Depth map -> 7 column averages (detects stationary obstacles)
+# - YOLO detections mapped to columns
+# - For each column: choose closest source (depth vs any YOLO detection)
+#   -> person => dynamic heartbeat (amplitude + frequency scale with distance)
+#   -> object or depth-only => continuous buzz (amplitude scales with distance)
+# - Idle columns: motors off
+# - MODE_REALTIME control, minimal I2C writes, no threads
+
+import degirum as dg
+import degirum_tools
+from picamera2 import Picamera2
+import cv2
+import numpy as np
+import time
+import math
+import board
+import busio
+import adafruit_tca9548a
+from adafruit_drv2605 import DRV2605, MODE_REALTIME
+
+# ------------------- CONFIG -------------------
+CAM_W, CAM_H = 960, 540
+DEPTH_MODEL_SIZE = 224
+NUM_COLUMNS = 7
+KNOWN_DISTANCE = 2.5
+KNOWN_WIDTH = 0.4
+
+UPDATE_INTERVAL = 0.08    # s between motor I2C write cycles
+MIN_UPDATE_STEP = 3       # min intensity change to write
+MAX_DEPTH = 4.0           # maximum range to consider obstacle relevant
+MIN_DEPTH = 0.5           # closest depth for full intensity
+
+# heartbeat base params (will scale with distance)
+HB_PULSE1 = 0.12
+HB_GAP = 0.08
+HB_PULSE2 = 0.12
+HB_BASE_REST = 0.6       # rest portion added to period
+
+PERCEPTUAL_EXP = 0.6     # Stevens' power law exponent
+
+# ------------------- CAMERA & MODELS -------------------
+camera = Picamera2()
+camera.configure(camera.create_preview_configuration(
+    main={"size": (CAM_W, CAM_H), "format": "RGB888"}))
+camera.start()
+time.sleep(1.2)
+
+# Load models (paths same as your setup)
+depth_model = dg.load_model("fastdepth--224x224_quant_hailort_hailo8_1", "@local",
+                            "/home/rohan/degirum_wearable_device/models")
+det_model = dg.load_model("yolo11n_silu_coco--640x640_quant_hailort_hailo8_1", "@local",
+                          "/home/rohan/degirum_wearable_device/models",
+                          overlay_show_labels=False, overlay_show_probabilities=False)
+
+tracker = degirum_tools.ObjectTracker(track_thresh=0.4,
+                                      anchor_point=degirum_tools.AnchorPoint.CENTER,
+                                      show_overlay=False)
+
+# ------------------- I2C + DRV SETUP -------------------
+i2c = busio.I2C(board.SCL, board.SDA)
+mux = adafruit_tca9548a.TCA9548A(i2c)
+
+# channels you used previously (adjust if wiring differs)
+drv_channels = [mux[i] for i in [1, 2, 3, 4, 5, 6, 7]]
+drvs = []
+for idx, ch in enumerate(drv_channels):
+    try:
+        time.sleep(0.12)
+        d = DRV2605(ch)
+        d.mode = MODE_REALTIME
+        d.realtime_value = 0
+        drvs.append(d)
+    except OSError as e:
+        print(f"⚠️ DRV init failed on channel {idx}: {e}")
+
+NUM_MOTORS = len(drvs)
+if NUM_MOTORS < NUM_COLUMNS:
+    print(f"⚠️ Found {NUM_MOTORS} motors but expected {NUM_COLUMNS}. Mapping will be truncated.")
+
+# ------------------- UTILITIES -------------------
+
+
+def depth_result_to_map(depth_result):
+    """Convert degirum depth_result to CAM_H x CAM_W float32 depth map in meters."""
+    raw = depth_result._inference_results[0]['data']
+    scale = depth_result._inference_results[0]['quantization']['scale'][0]
+    zero = depth_result._inference_results[0]['quantization']['zero'][0]
+    depth_map = (raw.astype(np.float32) - zero) * scale
+    depth_map = depth_map.reshape((DEPTH_MODEL_SIZE, DEPTH_MODEL_SIZE))
+    depth_resized = cv2.resize(depth_map, (CAM_W, CAM_H), interpolation=cv2.INTER_LINEAR)
+    return depth_resized
+
+
+def column_avg_depths(depth_map):
+    """Return list of average depths (meters) for each vertical column."""
+    h, w = depth_map.shape
+    col_w = w // NUM_COLUMNS
+    avgs = []
+    for i in range(NUM_COLUMNS):
+        x0 = i * col_w
+        x1 = (i+1)*col_w if i < NUM_COLUMNS - 1 else w
+        seg = depth_map[:, x0:x1]
+        # ignore NaNs
+        val = float(np.nanmean(seg))
+        avgs.append(val)
+    return avgs
+
+
+def perceptual_map(depth_value, min_d=MIN_DEPTH, max_d=MAX_DEPTH):
+    """Map depth in meters to 0..127 intensity (closer => stronger)."""
+    if depth_value is None or np.isnan(depth_value):
+        return 0
+    if depth_value >= max_d:
+        return 0
+    if depth_value <= min_d:
+        return 127
+    normalized = 1.0 - (depth_value - min_d) / (max_d - min_d)  # 1 near, 0 far
+    perceptual = math.pow(normalized, PERCEPTUAL_EXP)
+    return int(max(0, min(127, round(perceptual * 127))))
+
+
+def compute_focal_length(known_distance, real_width, width_in_image):
+    return (width_in_image * known_distance) / real_width
+
+
+def compute_distance_from_bbox(focal_length, real_width, width_in_image):
+    if width_in_image <= 0 or focal_length is None:
+        return None
+    return (real_width * focal_length) / width_in_image
+
+
+def motors_for_bbox(x1, x2):
+    """Return motor indices (columns) overlapped by bbox [x1,x2]."""
+    w = CAM_W
+    col_w = w / NUM_COLUMNS
+    first = int(max(0, math.floor(x1 / col_w)))
+    last = int(min(NUM_COLUMNS - 1, math.floor((x2 - 1) / col_w)))
+    return [i for i in range(first, last+1) if i < NUM_MOTORS]
+
+
+# ------------------- STATE -------------------
+pattern_state = {i: {"mode": "none", "hb_start": 0.0, "last_value": 0} for i in range(NUM_MOTORS)}
+last_global_update = 0.0
+
+# ------------------- CALIBRATION (quick) -------------------
+print("Place a person at ~2.5 m for quick focal calibration...")
+time.sleep(1.2)
+ref_frame = camera.capture_array("main")
+ref_det = det_model.predict(ref_frame)
+ref_width = 0
+for det in ref_det.results:
+    if det.get("label", "").lower() == "person":
+        x1, y1, x2, y2 = det["bbox"]
+        ref_width = x2 - x1
+        break
+FOCAL_LENGTH = None
+if ref_width > 0:
+    FOCAL_LENGTH = compute_focal_length(KNOWN_DISTANCE, KNOWN_WIDTH, ref_width)
+    print(f"✅ Calibrated focal length: {FOCAL_LENGTH:.2f}px")
+else:
+    print("⚠️ Calibration skipped (no person found). Fallback will use depth for YOLO distances.")
+
+# ------------------- MAIN LOOP -------------------
+print("Running. Press 'q' in display window to quit.")
+with degirum_tools.Display("Haptic v3.3 Depth-first (closest override)") as disp:
+    while True:
+        frame = camera.capture_array("main")
+
+        # 1) run detection + tracking
+        det_result = det_model.predict(frame)
+        try:
+            tracker.analyze(det_result)
+        except Exception:
+            pass
+        img = tracker.annotate(det_result, det_result.image_overlay)
+
+        # 2) run depth model and compute column averages
+        depth_result = depth_model.predict(frame)
+        depth_map = depth_result_to_map(depth_result)
+        col_depths = column_avg_depths(depth_map)  # length NUM_COLUMNS
+
+        # 3) Build candidate activations:
+        # For each column we will determine if there's a "depth obstacle" (depth_val < MAX_DEPTH)
+        # And also gather YOLO detections overlapping columns with estimated distances.
+        now = time.time()
+        # Start with depth candidates:
+        column_candidates = {}  # midx -> ("depth", distance)
+        for midx, d in enumerate(col_depths):
+            if midx >= NUM_MOTORS:
+                break
+            if not np.isnan(d) and d < MAX_DEPTH:
+                column_candidates[midx] = ("depth", float(d), now)
+
+        # Now add YOLO detection candidates (could be person or object)
+        # For each detection, estimate a distance (use bbox & focal length if available; else use depth_map inside bbox)
+        for det in det_result.results:
+            label = det.get("label", "").lower()
+            x1, y1, x2, y2 = det["bbox"]
+            width_px = x2 - x1
+            if FOCAL_LENGTH:
+                bb_dist = compute_distance_from_bbox(FOCAL_LENGTH, KNOWN_WIDTH, width_px)
+            else:
+                # fallback to depth average inside bbox area
+                x1i, x2i = max(0, int(x1)), min(CAM_W-1, int(x2))
+                y1i, y2i = max(0, int(y1)), min(CAM_H-1, int(y2))
+                if y2i > y1i and x2i > x1i:
+                    bb_dist = float(np.nanmean(depth_map[y1i:y2i, x1i:x2i]))
+                else:
+                    bb_dist = None
+
+            motors = motors_for_bbox(x1, x2)
+            for midx in motors:
+                # if there's already a candidate, keep the closer one (min distance)
+                prev = column_candidates.get(midx)
+                if bb_dist is None:
+                    # if no distance available, treat as less-specific; only overwrite if prev absent
+                    if prev is None:
+                        column_candidates[midx] = (label, bb_dist, now)
+                else:
+                    if prev is None:
+                        column_candidates[midx] = (label, float(bb_dist), now)
+                    else:
+                        # prev distance may be None for depth-only; pick whichever is closer when both distances exist
+                        prev_label, prev_dist, _ = prev
+                        if prev_dist is None:
+                            # candidate has distance, prefer it
+                            column_candidates[midx] = (label, float(bb_dist), now)
+                        else:
+                            # both have numeric distances => choose closer
+                            if bb_dist < prev_dist:
+                                column_candidates[midx] = (label, float(bb_dist), now)
+                            else:
+                                # keep prev (depth or other detection)
+                                pass
+
+        # 4) Build desired_values only for columns where winner exists
+        desired_values = [0] * NUM_MOTORS
+        for midx in range(NUM_MOTORS):
+            cand = column_candidates.get(midx)
+            if cand is None:
+                # no candidate => motor idle (0)
+                pattern_state[midx]["mode"] = "none"
+                desired_values[midx] = 0
+                continue
+            label_or_depth, dist_val, _ = cand
+            # label_or_depth may be 'depth' or a label name like 'person' or 'chair'
+            if label_or_depth == "depth":
+                # depth-only stationary obstacle: continuous buzz
+                intensity = perceptual_map(dist_val)
+                pattern_state[midx]["mode"] = "object"  # treat depth obstacle as object
+                desired_values[midx] = intensity
+            else:
+                # YOLO-detected semantic object
+                # If label contains 'person' treat as person, else object
+                is_person = ("person" in str(label_or_depth).lower())
+                # If we have numeric distance use it; else fallback to column depth if present
+                if dist_val is None:
+                    # fallback
+                    fallback_d = col_depths[midx] if not np.isnan(col_depths[midx]) else None
+                    dist_val_eff = fallback_d
+                else:
+                    dist_val_eff = dist_val
+
+                intensity = perceptual_map(dist_val_eff) if dist_val_eff is not None else 0
+
+                if is_person:
+                    pattern_state[midx]["mode"] = "person"
+                else:
+                    pattern_state[midx]["mode"] = "object"
+                desired_values[midx] = intensity
+
+        # 5) compose final realtime values (heartbeat modulation for person)
+        final_values = [0] * NUM_MOTORS
+        tnow = time.time()
+        for midx in range(NUM_MOTORS):
+            mode = pattern_state[midx]["mode"]
+            base_val = desired_values[midx]
+            # Determine a dynamic heartbeat scale based on distance (closer => faster)
+            if mode == "person" and base_val > 0:
+                # we can deduce a rough distance by inverse of intensity mapping:
+                # choose hb_scale by base_val: stronger base => closer => smaller period
+                # map base_val (0..127) to hb_scale in [1.0..0.4]
+                hb_scale = 1.0 - (base_val / 127.0) * 0.6  # base_val=127 -> 0.4; base_val small -> ~1.0
+                HB_P1 = HB_PULSE1 * hb_scale
+                HB_G = HB_GAP * hb_scale
+                HB_P2 = HB_PULSE2 * hb_scale
+                HB_PERIOD = HB_P1 + HB_G + HB_P2 + (HB_BASE_REST * hb_scale)
+
+                hb = pattern_state[midx].get("hb_start", 0.0)
+                if hb == 0.0 or (tnow - hb) > HB_PERIOD:
+                    pattern_state[midx]["hb_start"] = tnow
+                    hb = tnow
+                phase = tnow - hb
+                # two-pulse envelope (on/off)
+                if 0 <= phase < HB_P1:
+                    mult = 1.0
+                elif HB_P1 <= phase < HB_P1 + HB_G:
+                    mult = 0.0
+                elif HB_P1 + HB_G <= phase < HB_P1 + HB_G + HB_P2:
+                    mult = 1.0
+                else:
+                    mult = 0.0
+                final = int(round(base_val * mult))
+            elif mode == "object" and base_val > 0:
+                # steady buzz (no heartbeat)
+                final = int(round(base_val))
+                # reset heartbeat marker
+                pattern_state[midx]["hb_start"] = 0.0
+            else:
+                final = 0
+                pattern_state[midx]["hb_start"] = 0.0
+
+            final_values[midx] = max(0, min(127, final))
+
+        # 6) Write to motors, minimizing writes
+        if (tnow - last_global_update) >= UPDATE_INTERVAL:
+            for midx, val in enumerate(final_values):
+                if midx >= NUM_MOTORS:
+                    break
+                last_val = pattern_state[midx].get("last_value", 0)
+                if abs(val - last_val) >= MIN_UPDATE_STEP or (val == 0 and last_val != 0):
+                    try:
+                        drvs[midx].mode = MODE_REALTIME
+                        drvs[midx].realtime_value = val
+                        pattern_state[midx]["last_value"] = val
+                    except OSError as e:
+                        print(f"⚠️ I2C write error on motor {midx}: {e}")
+            last_global_update = tnow
+
+        # 7) show annotated image and loop
+        disp.show(img)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+camera.close()
+cv2.destroyAllWindows()

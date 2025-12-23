@@ -1,0 +1,37 @@
+Code to free the camera occupation before the program starts:
+[Terminal Window]
+Step 1: lsof /dev/video* - to see which processes are occupying the camera
+Step 2: When the list appears, use " kill -9 [process number]"
+
+Example: 
+rohan@raspberrypi:~ $ lsof /dev/video*
+COMMAND    PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME
+pipewire  3884 rohan   65u   CHR  81,21      0t0  784 /dev/video4
+pipewire  3884 rohan   66u   CHR  81,24      0t0  787 /dev/video7
+pipewire  3884 rohan   67u   CHR  81,23      0t0  786 /dev/video6
+pipewire  3884 rohan   68u   CHR  81,18      0t0  781 /dev/video1
+pipewire  3884 rohan   69u   CHR   81,0      0t0  616 /dev/video20
+pipewire  3884 rohan   70u   CHR   81,3      0t0  620 /dev/video23
+pipewire  3884 rohan   71u   CHR   81,4      0t0  621 /dev/video24
+pipewire  3884 rohan   72u   CHR   81,7      0t0  624 /dev/video27
+pipewire  3884 rohan   73u   CHR   81,1      0t0  618 /dev/video21
+pipewire  3884 rohan   74u   CHR   81,5      0t0  622 /dev/video25
+pipewire  3884 rohan   75u   CHR   81,2      0t0  619 /dev/video22
+pipewire  3884 rohan   76u   CHR   81,6      0t0  623 /dev/video26
+wireplumb 3885 rohan   41u   CHR  81,21      0t0  784 /dev/video4
+wireplumb 3885 rohan   42u   CHR  81,24      0t0  787 /dev/video7
+wireplumb 3885 rohan   43u   CHR  81,23      0t0  786 /dev/video6
+wireplumb 3885 rohan   44u   CHR  81,18      0t0  781 /dev/video1
+wireplumb 3885 rohan   45u   CHR   81,0      0t0  616 /dev/video20
+wireplumb 3885 rohan   46u   CHR   81,3      0t0  620 /dev/video23
+wireplumb 3885 rohan   47u   CHR   81,4      0t0  621 /dev/video24
+wireplumb 3885 rohan   48u   CHR   81,7      0t0  624 /dev/video27
+wireplumb 3885 rohan   49u   CHR   81,1      0t0  618 /dev/video21
+wireplumb 3885 rohan   50u   CHR   81,5      0t0  622 /dev/video25
+wireplumb 3885 rohan   51u   CHR   81,2      0t0  619 /dev/video22
+wireplumb 3885 rohan   52u   CHR   81,6      0t0  623 /dev/video26
+
+rohan@raspberrypi:~ $ kill -9 3884
+rohan@raspberrypi:~ $ kill -9 3885
+
+Now, the camera is not preoccupied. 

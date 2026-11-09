@@ -1,0 +1,597 @@
+# haptic_camera_avoidance_direction_calibrated.py
+# ---------------------------------------------------------
+# Improved camera-based obstacle avoidance haptics
+#
+# IMPROVEMENTS:
+# - Press 's' to calibrate the user's forward/center direction
+# - Uses calibrated center instead of assuming exact frame midpoint
+# - Uses deadband + hysteresis for more stable left/center/right decisions
+# - Uses both bbox center and bbox overlap with zones for better direction accuracy
+#
+# RULES:
+# - obstacle on LEFT   -> pulse RIGHT-side actuators
+# - obstacle on RIGHT  -> pulse LEFT-side actuators
+# - obstacle in CENTER -> pulse FRONT actuators
+# ---------------------------------------------------------
+
+import time
+import threading
+import atexit
+import signal
+import sys
+import cv2
+
+from picamera2 import Picamera2
+
+import board
+import busio
+import adafruit_tca9548a
+from adafruit_drv2605 import DRV2605, MODE_REALTIME
+
+# ===================== CONFIG =====================
+
+CAM_W = 960
+CAM_H = 540
+SHOW_PREVIEW = True
+
+FRAME_SKIP = 1
+UPDATE_INTERVAL = 0.01
+STALE_TIMEOUT = 0.40
+MODE_HOLD_TIME = 0.18
+
+PULSE_ON_TIME = 0.16
+PULSE_OFF_TIME = 0.20
+
+MIN_CONTOUR_AREA = 4500
+THRESH_VAL = 120
+BLUR_K = 9
+
+ROI_TOP = 0.10
+ROI_BOTTOM = 1.00
+ROI_LEFT = 0.00
+ROI_RIGHT = 1.00
+
+MIN_INTENSITY = 35
+MID_INTENSITY = 75
+MAX_INTENSITY = 115
+
+X_EMA_ALPHA = 0.35
+AREA_EMA_ALPHA = 0.30
+
+# -------- Direction tuning --------
+# Deadband is the "safe center" region around the calibrated forward direction.
+# 12% of frame width on either side of calibrated center
+CENTER_DEADBAND_RATIO = 0.12
+HYSTERESIS_RATIO = 0.05           # extra margin before changing zones
+MIN_DIRECTION_PIXELS = 12         # ignore tiny x jitter
+
+# Requested logical groups
+FRONT_WARNING_RAW = [0, 2, 3, 6]
+MOVE_LEFT_RAW = [4, 0, 2]     # obstacle on right -> move left
+MOVE_RIGHT_RAW = [1, 7, 6]    # obstacle on left  -> move right
+
+# ===================== GLOBAL STATE =====================
+
+drivers = {}
+available_channels = set()
+picam2 = None
+
+state_lock = threading.Lock()
+
+haptic_state = {
+    "channels": [],
+    "intensity": 0,
+    "mode": "clear",
+    "last_seen": 0.0,
+    "running": True,
+}
+
+track_state = {
+    "x_center": None,
+    "area": None,
+    "mode": "clear",
+    "last_mode_change": 0.0,
+    "last_zone": "center",
+}
+
+direction_state = {
+    "calibrated_center_x": CAM_W // 2,
+    "is_calibrated": False,
+    "last_stable_x": None,
+}
+
+# ===================== HELPERS =====================
+
+
+def filter_available(channels):
+    return [ch for ch in channels if ch in available_channels and drivers.get(ch) is not None]
+
+
+def all_motors_off():
+    for ch, drv in drivers.items():
+        if drv is None:
+            continue
+        try:
+            drv.realtime_value = 0
+        except Exception:
+            pass
+
+
+def shutdown_system():
+    global picam2
+
+    with state_lock:
+        haptic_state["running"] = False
+        haptic_state["channels"] = []
+        haptic_state["intensity"] = 0
+        haptic_state["mode"] = "shutdown"
+
+    print("[SAFE EXIT] Turning off all actuators...")
+    all_motors_off()
+
+    try:
+        if picam2 is not None:
+            picam2.stop()
+            picam2 = None
+    except Exception:
+        pass
+
+    try:
+        cv2.destroyAllWindows()
+    except Exception:
+        pass
+
+
+def handle_exit(*args):
+    shutdown_system()
+    sys.exit(0)
+
+
+atexit.register(shutdown_system)
+signal.signal(signal.SIGINT, handle_exit)
+signal.signal(signal.SIGTERM, handle_exit)
+
+
+def ema(prev, new, alpha):
+    if prev is None:
+        return new
+    return alpha * new + (1.0 - alpha) * prev
+
+
+def clamp(val, low, high):
+    return max(low, min(high, val))
+
+# ===================== MOTOR SETUP =====================
+
+
+def safe_init_motors():
+    global drivers, available_channels
+    drivers = {}
+    available_channels = set()
+
+    try:
+        i2c = busio.I2C(board.SCL, board.SDA)
+        mux = adafruit_tca9548a.TCA9548A(i2c)
+
+        ok_count = 0
+        print("[INFO] Scanning motor channels...")
+
+        for ch in range(8):
+            try:
+                time.sleep(0.15)
+                drv = DRV2605(mux[ch])
+                drv.mode = MODE_REALTIME
+                drv.realtime_value = 0
+                drivers[ch] = drv
+                available_channels.add(ch)
+                ok_count += 1
+                print(f"[OK] Motor {ch} ready")
+            except Exception as e:
+                drivers[ch] = None
+                print(f"[WARN] Motor {ch} failed: {e}")
+
+        print(f"[INFO] Available channels: {sorted(list(available_channels))}")
+        return ok_count > 0
+
+    except Exception as e:
+        print(f"[FATAL] I2C / mux init failed: {e}")
+        return False
+
+# ===================== CAMERA SETUP =====================
+
+
+def init_camera(retries=5, delay=1.5):
+    global picam2
+
+    for attempt in range(1, retries + 1):
+        try:
+            print(f"[INFO] Camera init attempt {attempt}/{retries}")
+            picam2 = Picamera2()
+            config = picam2.create_preview_configuration(
+                main={"size": (CAM_W, CAM_H), "format": "RGB888"}
+            )
+            picam2.configure(config)
+            picam2.start()
+            time.sleep(1.0)
+            print("[OK] Camera started")
+            return True
+
+        except Exception as e:
+            print(f"[WARN] Camera init failed: {e}")
+            try:
+                if picam2 is not None:
+                    picam2.stop()
+            except Exception:
+                pass
+            picam2 = None
+            time.sleep(delay)
+
+    print("[FATAL] Camera stayed busy after all retries.")
+    print("[HINT] Close other camera apps or run: sudo reboot")
+    return False
+
+# ===================== VISION =====================
+
+
+def get_roi(frame):
+    h, w = frame.shape[:2]
+    y1 = int(h * ROI_TOP)
+    y2 = int(h * ROI_BOTTOM)
+    x1 = int(w * ROI_LEFT)
+    x2 = int(w * ROI_RIGHT)
+    return frame[y1:y2, x1:x2], (x1, y1)
+
+
+def get_camera_detections(frame):
+    detections = []
+
+    roi, (ox, oy) = get_roi(frame)
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+    blur = cv2.GaussianBlur(gray, (BLUR_K, BLUR_K), 0)
+    _, thresh = cv2.threshold(blur, THRESH_VAL, 255, cv2.THRESH_BINARY_INV)
+
+    contours, _ = cv2.findContours(
+        thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < MIN_CONTOUR_AREA:
+            continue
+
+        x, y, w, h = cv2.boundingRect(c)
+
+        x1 = x + ox
+        y1 = y + oy
+        x2 = x + w + ox
+        y2 = y + h + oy
+
+        detections.append({
+            "label": "obstacle",
+            "bbox": (x1, y1, x2, y2),
+            "area": area,
+        })
+
+    return detections
+
+
+def choose_priority_detection(detections):
+    if not detections:
+        return None
+    return max(detections, key=lambda d: d.get("area", 0))
+
+# ===================== DIRECTION LOGIC =====================
+
+
+def overlap_length(a1, a2, b1, b2):
+    return max(0, min(a2, b2) - max(a1, b1))
+
+
+def calibrate_forward_center(x_center):
+    direction_state["calibrated_center_x"] = int(clamp(x_center, 0, CAM_W - 1))
+    direction_state["is_calibrated"] = True
+    print(
+        f"[CALIBRATED] Forward center set to x={direction_state['calibrated_center_x']}")
+
+
+def get_direction_zone_from_bbox(x1, x2, frame_width):
+    """
+    Better direction decision:
+    1) Uses calibrated center
+    2) Uses deadband around that center
+    3) Uses bbox overlap with left/center/right regions
+    4) Uses hysteresis so zone doesn't flicker
+    """
+    calibrated_center = direction_state["calibrated_center_x"]
+    last_zone = track_state["last_zone"]
+
+    deadband_px = int(frame_width * CENTER_DEADBAND_RATIO)
+    hysteresis_px = int(frame_width * HYSTERESIS_RATIO)
+
+    center_left = calibrated_center - deadband_px
+    center_right = calibrated_center + deadband_px
+
+    # Expand center zone slightly if we are already in center
+    if last_zone == "center":
+        center_left -= hysteresis_px
+        center_right += hysteresis_px
+
+    center_left = clamp(center_left, 0, frame_width - 1)
+    center_right = clamp(center_right, 0, frame_width - 1)
+
+    bbox_center = (x1 + x2) / 2.0
+    x_offset = bbox_center - calibrated_center
+
+    # Ignore tiny movement jitter
+    if direction_state["last_stable_x"] is None:
+        direction_state["last_stable_x"] = bbox_center
+    elif abs(bbox_center - direction_state["last_stable_x"]) < MIN_DIRECTION_PIXELS:
+        bbox_center = direction_state["last_stable_x"]
+        x_offset = bbox_center - calibrated_center
+    else:
+        direction_state["last_stable_x"] = bbox_center
+
+    # Region boundaries
+    left_start, left_end = 0, center_left
+    center_start, center_end = center_left, center_right
+    right_start, right_end = center_right, frame_width
+
+    left_overlap = overlap_length(x1, x2, left_start, left_end)
+    center_overlap = overlap_length(x1, x2, center_start, center_end)
+    right_overlap = overlap_length(x1, x2, right_start, right_end)
+
+    overlaps = {
+        "left": left_overlap,
+        "center": center_overlap,
+        "right": right_overlap,
+    }
+
+    overlap_zone = max(overlaps, key=overlaps.get)
+
+    # If object center is clearly offset, trust that.
+    if x_offset < -(deadband_px + hysteresis_px):
+        zone = "left"
+    elif x_offset > (deadband_px + hysteresis_px):
+        zone = "right"
+    else:
+        # Otherwise use overlap-based decision
+        zone = overlap_zone
+
+    # Final stabilizing hysteresis by previous zone
+    if last_zone == "left" and x_offset < hysteresis_px:
+        if zone == "center":
+            zone = "left"
+    elif last_zone == "right" and x_offset > -hysteresis_px:
+        if zone == "center":
+            zone = "right"
+
+    track_state["last_zone"] = zone
+    return zone, calibrated_center, center_left, center_right
+
+
+def area_to_intensity(area, frame_width, frame_height):
+    frame_area = float(frame_width * frame_height)
+    area_ratio = area / frame_area
+
+    if area_ratio >= 0.15:
+        return MAX_INTENSITY
+    elif area_ratio >= 0.06:
+        return MID_INTENSITY
+    return MIN_INTENSITY
+
+
+def stable_mode_select(candidate_mode):
+    now = time.time()
+    current_mode = track_state["mode"]
+
+    if current_mode == candidate_mode:
+        return current_mode
+
+    if now - track_state["last_mode_change"] < MODE_HOLD_TIME:
+        return current_mode
+
+    track_state["mode"] = candidate_mode
+    track_state["last_mode_change"] = now
+    return candidate_mode
+
+
+def choose_haptic_group(zone):
+    if zone == "left":
+        return filter_available(MOVE_RIGHT_RAW), "move_right"
+    elif zone == "right":
+        return filter_available(MOVE_LEFT_RAW), "move_left"
+    else:
+        return filter_available(FRONT_WARNING_RAW), "front_warning"
+
+# ===================== MOTOR LOOP =====================
+
+
+def motor_loop():
+    while True:
+        with state_lock:
+            running = haptic_state["running"]
+            active_channels = list(haptic_state["channels"])
+            intensity = int(haptic_state["intensity"])
+            last_seen = float(haptic_state["last_seen"])
+
+        if not running:
+            all_motors_off()
+            break
+
+        if (time.time() - last_seen) > STALE_TIMEOUT or not active_channels or intensity <= 0:
+            all_motors_off()
+            time.sleep(UPDATE_INTERVAL)
+            continue
+
+        # ON
+        for ch, drv in drivers.items():
+            if drv is None:
+                continue
+            try:
+                drv.realtime_value = intensity if ch in active_channels else 0
+            except Exception as e:
+                print(f"[WARN] Motor {ch} write failed: {e}")
+
+        time.sleep(PULSE_ON_TIME)
+
+        # OFF
+        all_motors_off()
+        time.sleep(PULSE_OFF_TIME)
+
+# ===================== MAIN =====================
+
+
+def main():
+    if not safe_init_motors():
+        print("[FATAL] No motors were initialized.")
+        return
+
+    if not init_camera(retries=5, delay=1.0):
+        print("[FATAL] Could not acquire camera. Another process is probably using it.")
+        return
+
+    if not filter_available(FRONT_WARNING_RAW) and not filter_available(MOVE_LEFT_RAW) and not filter_available(MOVE_RIGHT_RAW):
+        print("[FATAL] No valid haptic groups remain after filtering working channels.")
+        return
+
+    print(
+        f"[INFO] FRONT_WARNING active motors: {filter_available(FRONT_WARNING_RAW)}")
+    print(f"[INFO] MOVE_LEFT active motors: {filter_available(MOVE_LEFT_RAW)}")
+    print(
+        f"[INFO] MOVE_RIGHT active motors: {filter_available(MOVE_RIGHT_RAW)}")
+
+    print("[INFO] Press 's' to calibrate forward center using the current detected obstacle.")
+    print("[INFO] Press 'q' to quit.")
+
+    threading.Thread(target=motor_loop, daemon=True).start()
+
+    frame_count = 0
+
+    try:
+        while True:
+            frame = picam2.capture_array()
+            display_frame = frame.copy()
+
+            process_this_frame = (frame_count % (FRAME_SKIP + 1) == 0)
+            frame_count += 1
+
+            best = None
+            zone = "center"
+            intensity = 0
+            calibrated_center = direction_state["calibrated_center_x"]
+            center_left = calibrated_center - \
+                int(CAM_W * CENTER_DEADBAND_RATIO)
+            center_right = calibrated_center + \
+                int(CAM_W * CENTER_DEADBAND_RATIO)
+
+            if process_this_frame:
+                detections = get_camera_detections(frame)
+                best = choose_priority_detection(detections)
+
+                if best is not None:
+                    x1, y1, x2, y2 = best["bbox"]
+                    raw_x_center = (x1 + x2) // 2
+                    raw_area = best["area"]
+
+                    track_state["x_center"] = ema(
+                        track_state["x_center"], raw_x_center, X_EMA_ALPHA)
+                    track_state["area"] = ema(
+                        track_state["area"], raw_area, AREA_EMA_ALPHA)
+
+                    # Use smoothed center to build a smoothed bbox center
+                    box_width = (x2 - x1)
+                    smooth_x1 = int(track_state["x_center"] - box_width / 2)
+                    smooth_x2 = int(track_state["x_center"] + box_width / 2)
+
+                    zone, calibrated_center, center_left, center_right = get_direction_zone_from_bbox(
+                        smooth_x1, smooth_x2, CAM_W
+                    )
+
+                    channels, candidate_mode = choose_haptic_group(zone)
+                    mode = stable_mode_select(candidate_mode)
+                    intensity = area_to_intensity(
+                        track_state["area"], CAM_W, CAM_H)
+
+                    # keep channels aligned with stabilized mode
+                    if mode == "move_right":
+                        channels = filter_available(MOVE_RIGHT_RAW)
+                    elif mode == "move_left":
+                        channels = filter_available(MOVE_LEFT_RAW)
+                    elif mode == "front_warning":
+                        channels = filter_available(FRONT_WARNING_RAW)
+                    else:
+                        channels = []
+
+                    with state_lock:
+                        haptic_state["channels"] = channels
+                        haptic_state["intensity"] = intensity
+                        haptic_state["mode"] = mode
+                        haptic_state["last_seen"] = time.time()
+
+                    print(
+                        f"[HAPTIC] zone={zone} mode={mode} motors={channels} "
+                        f"intensity={intensity} calib_x={calibrated_center}"
+                    )
+
+                    if SHOW_PREVIEW:
+                        cv2.rectangle(display_frame, (x1, y1),
+                                      (x2, y2), (0, 255, 0), 2)
+                        cv2.line(display_frame, (calibrated_center, 0),
+                                 (calibrated_center, CAM_H), (255, 255, 0), 2)
+                        cv2.line(display_frame, (center_left, 0),
+                                 (center_left, CAM_H), (255, 0, 255), 1)
+                        cv2.line(display_frame, (center_right, 0),
+                                 (center_right, CAM_H), (255, 0, 255), 1)
+
+                        cal_text = "CALIBRATED" if direction_state["is_calibrated"] else "NOT CALIBRATED"
+                        cv2.putText(
+                            display_frame,
+                            f"{zone} -> {mode} | I={intensity} | {cal_text}",
+                            (x1, max(30, y1 - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (0, 255, 0),
+                            2
+                        )
+                else:
+                    with state_lock:
+                        haptic_state["channels"] = []
+                        haptic_state["intensity"] = 0
+                        haptic_state["mode"] = "clear"
+
+            if SHOW_PREVIEW:
+                roi_frame, (ox, oy) = get_roi(frame)
+                cv2.rectangle(
+                    display_frame,
+                    (ox, oy),
+                    (ox + roi_frame.shape[1], oy + roi_frame.shape[0]),
+                    (255, 0, 0),
+                    1
+                )
+
+                cv2.imshow(
+                    "Improved Direction Calibrated Obstacle Avoidance",
+                    cv2.cvtColor(display_frame, cv2.COLOR_RGB2BGR)
+                )
+
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == ord("q"):
+                break
+
+            elif key == ord("s"):
+                # Calibrate using current tracked x center if available
+                if track_state["x_center"] is not None:
+                    calibrate_forward_center(track_state["x_center"])
+                else:
+                    print("[WARN] Nothing detected to calibrate from.")
+
+    except KeyboardInterrupt:
+        print("\n[CTRL+C] Interrupted by user")
+
+    finally:
+        shutdown_system()
+
+
+if __name__ == "__main__":
+    main()

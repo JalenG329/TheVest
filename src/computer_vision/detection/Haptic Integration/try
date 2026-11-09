@@ -1,0 +1,30 @@
+import time
+import board
+import busio
+import adafruit_tca9548a
+from adafruit_drv2605 import DRV2605, MODE_REALTIME
+
+i2c = busio.I2C(board.SCL, board.SDA)
+tca = adafruit_tca9548a.TCA9548A(i2c)
+
+drivers = []
+
+for channel in range(8):
+    try:
+        drv = DRV2605(tca[channel])
+        drv.mode = MODE_REALTIME
+        drivers.append((channel, drv))
+        print(f"Motor on channel {channel} initialized")
+    except:
+        print(f"No motor on channel {channel}")
+
+print("\nTesting motors...\n")
+
+for channel, drv in drivers:
+    print(f"Testing channel {channel}")
+    drv.realtime_value = 80
+    time.sleep(1)
+    drv.realtime_value = 0
+    time.sleep(0.5)
+
+print("Done.")

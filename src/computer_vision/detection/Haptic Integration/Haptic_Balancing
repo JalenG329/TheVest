@@ -1,0 +1,481 @@
+# ---------------------------------------------------------
+# ADVANCED HAPTIC BALANCE / SLOUCH DETECTION SYSTEM
+# ---------------------------------------------------------
+# Features:
+# - torso-anchor posture tracking
+# - initial calibration + optional object-assisted calibration
+# - adaptive neutral posture update
+# - minimum person area filtering
+# - entry / hold / release state machine
+# - slower, human-friendly haptic pulses
+# - safe motor shutdown
+# - debug overlay for teacher demo
+# ---------------------------------------------------------
+
+import degirum as dg
+import degirum_tools
+from picamera2 import Picamera2
+import cv2
+import numpy as np
+import time
+import board
+import busio
+import adafruit_tca9548a
+from adafruit_drv2605 import DRV2605, MODE_REALTIME
+
+# ===================== CONFIG =====================
+
+CAM_W, CAM_H = 960, 540
+
+# ----- Initial calibration -----
+INITIAL_CALIBRATION_SEC = 3.0
+MIN_CALIBRATION_SAMPLES = 15
+
+# ----- Optional object-assisted reference -----
+# This does NOT replace person posture tracking.
+# It only helps stabilize the scene reference if a stable object is visible.
+USE_OBJECT_REFERENCE = True
+REFERENCE_OBJECT_LABELS = {"chair", "bottle", "backpack", "tv"}
+OBJECT_WEIGHT = 0.15   # small influence only
+
+# ----- Smoothing -----
+EMA_ALPHA_X = 0.20
+EMA_ALPHA_Y = 0.20
+EMA_ALPHA_H = 0.16
+
+# ----- Adaptive neutral posture -----
+ADAPTIVE_NEUTRAL_RATE = 0.010
+ADAPTIVE_NEUTRAL_MAX_DX = 16
+ADAPTIVE_NEUTRAL_MAX_DY = 14
+
+# ----- Thresholds -----
+# Lateral lean thresholds
+X_COMFORT = 22
+X_GUIDE = 42
+X_STRONG = 72
+
+# Forward bend thresholds
+Y_COMFORT = 18
+Y_GUIDE = 32
+Y_STRONG = 52
+
+# Helps forward-bend detection if bbox height shrinks
+HEIGHT_DROP_GAIN = 0.28
+
+# ----- Target validity -----
+MIN_PERSON_AREA = 22000
+NO_PERSON_TIMEOUT = 0.8
+
+# ----- State machine -----
+ENTER_FRAMES = 3
+EXIT_FRAMES = 4
+
+# ----- Motor update -----
+UPDATE_INTERVAL = 0.05
+RAMP_FACTOR = 0.50
+MIN_INTENSITY_CHANGE = 2
+
+# ===================== MOTOR GROUPS =====================
+
+LEFT_CLUSTER = [4, 5, 6]     # fire when user leans RIGHT
+RIGHT_CLUSTER = [2, 7, 0]    # fire when user leans LEFT
+FORWARD_CLUSTER = [2, 1]     # fire when user bends FORWARD
+
+ALL_MOTORS = [0, 1, 2, 4, 5, 6, 7]
+
+# ===================== SLOWER PULSE PATTERNS =====================
+# Slower and easier for humans to interpret
+
+SOFT_PATTERN = [
+    (0.24, 0.60),
+    (0.55, 0.00),
+    (0.20, 0.40),
+    (0.75, 0.00),
+]
+
+MEDIUM_PATTERN = [
+    (0.28, 0.90),
+    (0.55, 0.00),
+    (0.24, 0.70),
+    (0.75, 0.00),
+]
+
+STRONG_PATTERN = [
+    (0.32, 1.00),
+    (0.60, 0.00),
+    (0.28, 0.85),
+    (0.85, 0.00),
+]
+
+# ===================== HARDWARE =====================
+
+i2c = busio.I2C(board.SCL, board.SDA)
+mux = adafruit_tca9548a.TCA9548A(i2c)
+
+motors = {}
+current_intensity = {}
+
+for ch in ALL_MOTORS:
+    try:
+        time.sleep(0.10)
+        drv = DRV2605(mux[ch])
+        drv.mode = MODE_REALTIME
+        drv.realtime_value = 0
+        motors[ch] = drv
+        current_intensity[ch] = 0
+        print(f"[INIT] Motor {ch} ready")
+    except Exception as e:
+        motors[ch] = None
+        current_intensity[ch] = 0
+        print(f"[WARN] Motor {ch} failed: {e}")
+
+# ===================== HELPERS =====================
+
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+def shutdown_motors():
+    print("[EXIT] Turning off motors")
+    for ch in ALL_MOTORS:
+        try:
+            if motors[ch] is not None:
+                motors[ch].realtime_value = 0
+        except Exception:
+            pass
+
+def set_motor(ch, target):
+    if motors[ch] is None:
+        return
+
+    target = clamp(int(target), 0, 127)
+    current = current_intensity[ch]
+
+    new_val = current + int(RAMP_FACTOR * (target - current))
+    new_val = clamp(new_val, 0, 127)
+
+    if abs(new_val - current) >= MIN_INTENSITY_CHANGE or (new_val == 0 and current != 0):
+        motors[ch].realtime_value = new_val
+        current_intensity[ch] = new_val
+
+def apply_targets(targets):
+    for ch in ALL_MOTORS:
+        set_motor(ch, targets.get(ch, 0))
+
+def pattern_value(pattern, intensity, now):
+    cycle = sum(d for d, _ in pattern)
+    t = now % cycle
+    elapsed = 0.0
+
+    for duration, scale in pattern:
+        if elapsed <= t < elapsed + duration:
+            return int(intensity * scale)
+        elapsed += duration
+
+    return 0
+
+def apply_pattern(cluster, intensity, pattern, targets, now):
+    val = pattern_value(pattern, intensity, now)
+    for ch in cluster:
+        targets[ch] = max(targets.get(ch, 0), val)
+
+def ema(prev, new, alpha):
+    if prev is None:
+        return float(new)
+    return (1.0 - alpha) * prev + alpha * float(new)
+
+def zone_to_feedback(offset, comfort, guide, strong):
+    mag = abs(offset)
+    if mag < comfort:
+        return "comfort"
+    elif mag < guide:
+        return "guide"
+    elif mag < strong:
+        return "medium"
+    else:
+        return "strong"
+
+def largest_person_bbox(det_res):
+    best_bbox = None
+    best_area = 0
+
+    for det in det_res.results:
+        if det.get("label", "").lower() != "person":
+            continue
+
+        x1, y1, x2, y2 = det["bbox"]
+        area = max(0, x2 - x1) * max(0, y2 - y1)
+
+        if area > best_area:
+            best_area = area
+            best_bbox = (x1, y1, x2, y2)
+
+    return best_bbox, best_area
+
+def pick_reference_object(det_res):
+    best = None
+    best_area = 0
+
+    for det in det_res.results:
+        label = det.get("label", "").lower()
+        if label not in REFERENCE_OBJECT_LABELS:
+            continue
+
+        x1, y1, x2, y2 = det["bbox"]
+        area = max(0, x2 - x1) * max(0, y2 - y1)
+
+        if area > best_area:
+            best_area = area
+            best = (label, x1, y1, x2, y2)
+
+    return best
+
+def torso_anchor_from_bbox(bbox):
+    x1, y1, x2, y2 = bbox
+    w = x2 - x1
+    h = y2 - y1
+
+    # More stable than full bbox center
+    tx = x1 + 0.50 * w
+    ty = y1 + 0.42 * h
+    return tx, ty, h
+
+# ===================== CAMERA =====================
+
+camera = Picamera2()
+camera.configure(camera.create_preview_configuration(
+    main={"size": (CAM_W, CAM_H), "format": "RGB888"}
+))
+camera.start()
+time.sleep(1.2)
+
+# ===================== MODEL =====================
+
+det_model = dg.load_model(
+    "yolo11n_silu_coco--640x640_quant_hailort_hailo8_1",
+    "@local",
+    "/home/rohan/degirum_wearable_device/models",
+    overlay_show_labels=False,
+    overlay_show_probabilities=False,
+)
+
+# ===================== STATE =====================
+
+smooth_x = None
+smooth_y = None
+smooth_h = None
+
+neutral_x = None
+neutral_y = None
+neutral_h = None
+
+calib_x = []
+calib_y = []
+calib_h = []
+
+last_seen_person = 0.0
+last_update = 0.0
+
+stable_state = "CENTERED"
+candidate_state = "CENTERED"
+candidate_count = 0
+center_count = 0
+
+ref_object_x = None
+
+# ===================== MAIN LOOP =====================
+
+print("Starting advanced balance system...")
+print("Stand naturally for calibration.")
+print("Press q to quit.")
+
+calibration_start = time.time()
+
+try:
+    while True:
+        now = time.time()
+        frame = camera.capture_array("main")
+        motor_targets = {ch: 0 for ch in ALL_MOTORS}
+
+        det_res = det_model.predict(frame)
+
+        # ---------- OPTIONAL OBJECT REFERENCE ----------
+        obj = pick_reference_object(det_res)
+        if obj is not None:
+            label, ox1, oy1, ox2, oy2 = obj
+            ref_object_x = (ox1 + ox2) / 2.0
+            cv2.rectangle(frame, (int(ox1), int(oy1)), (int(ox2), int(oy2)), (255, 200, 0), 2)
+            cv2.putText(frame, f"Ref: {label}", (int(ox1), int(oy1) - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 200, 0), 2)
+
+        # ---------- PERSON DETECTION ----------
+        bbox, area = largest_person_bbox(det_res)
+
+        detected_state = "CENTERED"
+        posture_state = "CENTERED"
+
+        dx = 0.0
+        dy = 0.0
+        forward_score = 0.0
+
+        if bbox is not None and area >= MIN_PERSON_AREA:
+            last_seen_person = now
+
+            x1, y1, x2, y2 = bbox
+            tx, ty, bh = torso_anchor_from_bbox(bbox)
+
+            smooth_x = ema(smooth_x, tx, EMA_ALPHA_X)
+            smooth_y = ema(smooth_y, ty, EMA_ALPHA_Y)
+            smooth_h = ema(smooth_h, bh, EMA_ALPHA_H)
+
+            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+            cv2.circle(frame, (int(smooth_x), int(smooth_y)), 6, (255, 255, 0), -1)
+
+            # ---------- INITIAL CALIBRATION ----------
+            if neutral_x is None:
+                base_x = smooth_x
+                if USE_OBJECT_REFERENCE and ref_object_x is not None:
+                    base_x = (1.0 - OBJECT_WEIGHT) * smooth_x + OBJECT_WEIGHT * ref_object_x
+
+                calib_x.append(base_x)
+                calib_y.append(smooth_y)
+                calib_h.append(smooth_h)
+
+                remain = INITIAL_CALIBRATION_SEC - (now - calibration_start)
+                cv2.putText(frame, f"Calibrating... {max(0, remain):.1f}s",
+                            (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+
+                if (now - calibration_start) >= INITIAL_CALIBRATION_SEC and len(calib_x) >= MIN_CALIBRATION_SAMPLES:
+                    neutral_x = float(np.mean(calib_x))
+                    neutral_y = float(np.mean(calib_y))
+                    neutral_h = float(np.mean(calib_h))
+                    print(f"[CALIBRATED] neutral_x={neutral_x:.1f}, neutral_y={neutral_y:.1f}, neutral_h={neutral_h:.1f}")
+
+            else:
+                # ---------- ADAPTIVE NEUTRAL ----------
+                raw_dx = smooth_x - neutral_x
+                raw_dy = smooth_y - neutral_y
+
+                if abs(raw_dx) < ADAPTIVE_NEUTRAL_MAX_DX and abs(raw_dy) < ADAPTIVE_NEUTRAL_MAX_DY:
+                    neutral_x = (1.0 - ADAPTIVE_NEUTRAL_RATE) * neutral_x + ADAPTIVE_NEUTRAL_RATE * smooth_x
+                    neutral_y = (1.0 - ADAPTIVE_NEUTRAL_RATE) * neutral_y + ADAPTIVE_NEUTRAL_RATE * smooth_y
+                    neutral_h = (1.0 - ADAPTIVE_NEUTRAL_RATE) * neutral_h + ADAPTIVE_NEUTRAL_RATE * smooth_h
+
+                # ---------- OFFSETS ----------
+                dx = smooth_x - neutral_x
+                dy = smooth_y - neutral_y
+                dh = smooth_h - neutral_h
+
+                forward_score = dy + max(0, -dh * HEIGHT_DROP_GAIN)
+
+                # Raw detected posture
+                if dx > X_COMFORT:
+                    detected_state = "LEAN_RIGHT"
+                elif dx < -X_COMFORT:
+                    detected_state = "LEAN_LEFT"
+                elif forward_score > Y_COMFORT:
+                    detected_state = "FORWARD_BEND"
+                else:
+                    detected_state = "CENTERED"
+
+        # ---------- STATE MACHINE ----------
+        if neutral_x is not None:
+            if detected_state == stable_state:
+                candidate_state = stable_state
+                candidate_count = 0
+            else:
+                if detected_state == candidate_state:
+                    candidate_count += 1
+                else:
+                    candidate_state = detected_state
+                    candidate_count = 1
+
+                if candidate_count >= ENTER_FRAMES:
+                    stable_state = candidate_state
+                    candidate_count = 0
+
+            if stable_state == "CENTERED":
+                center_count = 0
+            else:
+                if detected_state == "CENTERED":
+                    center_count += 1
+                    if center_count >= EXIT_FRAMES:
+                        stable_state = "CENTERED"
+                        center_count = 0
+                else:
+                    center_count = 0
+
+        # ---------- FEEDBACK SELECTION ----------
+        if neutral_x is not None:
+            x_zone = zone_to_feedback(dx, X_COMFORT, X_GUIDE, X_STRONG)
+            y_zone = zone_to_feedback(forward_score, Y_COMFORT, Y_GUIDE, Y_STRONG)
+
+            if stable_state == "LEAN_RIGHT":
+                posture_state = f"LEAN RIGHT ({x_zone.upper()})"
+                if x_zone == "guide":
+                    apply_pattern(LEFT_CLUSTER, 70, SOFT_PATTERN, motor_targets, now)
+                elif x_zone == "medium":
+                    apply_pattern(LEFT_CLUSTER, 98, MEDIUM_PATTERN, motor_targets, now)
+                else:
+                    apply_pattern(LEFT_CLUSTER, 120, STRONG_PATTERN, motor_targets, now)
+
+            elif stable_state == "LEAN_LEFT":
+                posture_state = f"LEAN LEFT ({x_zone.upper()})"
+                if x_zone == "guide":
+                    apply_pattern(RIGHT_CLUSTER, 70, SOFT_PATTERN, motor_targets, now)
+                elif x_zone == "medium":
+                    apply_pattern(RIGHT_CLUSTER, 98, MEDIUM_PATTERN, motor_targets, now)
+                else:
+                    apply_pattern(RIGHT_CLUSTER, 120, STRONG_PATTERN, motor_targets, now)
+
+            elif stable_state == "FORWARD_BEND":
+                posture_state = f"FORWARD BEND ({y_zone.upper()})"
+                if y_zone == "guide":
+                    apply_pattern(FORWARD_CLUSTER, 74, SOFT_PATTERN, motor_targets, now)
+                elif y_zone == "medium":
+                    apply_pattern(FORWARD_CLUSTER, 102, MEDIUM_PATTERN, motor_targets, now)
+                else:
+                    apply_pattern(FORWARD_CLUSTER, 124, STRONG_PATTERN, motor_targets, now)
+
+            else:
+                posture_state = "CENTERED"
+
+        # ---------- LOST PERSON ----------
+        if bbox is None and (now - last_seen_person) > NO_PERSON_TIMEOUT:
+            motor_targets = {ch: 0 for ch in ALL_MOTORS}
+            stable_state = "CENTERED"
+            candidate_state = "CENTERED"
+            candidate_count = 0
+            center_count = 0
+            posture_state = "NO PERSON"
+
+        # ---------- APPLY MOTOR TARGETS ----------
+        if now - last_update >= UPDATE_INTERVAL:
+            apply_targets(motor_targets)
+            last_update = now
+
+        # ---------- DEBUG OVERLAY ----------
+        if neutral_x is not None:
+            cv2.line(frame, (int(neutral_x), 0), (int(neutral_x), CAM_H), (255, 0, 0), 2)
+            cv2.line(frame, (0, int(neutral_y)), (CAM_W, int(neutral_y)), (255, 0, 0), 2)
+
+        cv2.putText(frame, f"State: {posture_state}",
+                    (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 0), 2)
+        cv2.putText(frame, f"dx={dx:.1f} forward={forward_score:.1f}",
+                    (20, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
+        cv2.putText(frame, f"stable={stable_state} cand={candidate_state} count={candidate_count}",
+                    (20, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (180, 255, 180), 2)
+
+        print(f"{posture_state} | dx={dx:.1f} forward={forward_score:.1f}")
+
+        cv2.imshow("Advanced Haptic Balance System", frame)
+
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+except KeyboardInterrupt:
+    print("Stopped by user")
+
+finally:
+    shutdown_motors()
+    camera.close()
+    cv2.destroyAllWindows()
